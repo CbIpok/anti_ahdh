@@ -24,7 +24,7 @@ bot = telebot.TeleBot(config.TOKEN)
 main_messages = {}        # chat_id -> message_id основного сообщения
 timer_threads = {}        # chat_id -> запущенный поток таймера
 timer_stop_flags = {}     # chat_id -> threading.Event для остановки потока
-user_states = {}          # chat_id -> dict с состоянием ввода (например, "adding_category", "adding_task")
+user_states = {}          # chat_id -> dict с состоянием ввода (например, "adding_category", "editing_category", "adding_task")
 
 # ==========================
 # Работа с базой данных (SQLite)
@@ -67,9 +67,17 @@ def get_db_connection():
     return sqlite3.connect(DB_PATH)
 
 # ==========================
-# Функции формирования клавиатур
+# Вспомогательные функции
 # ==========================
 
+def format_time(seconds):
+    """Преобразует секунды в формат ЧЧ:ММ:СС"""
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+# Формирование клавиатур
 def get_main_keyboard():
     markup = types.InlineKeyboardMarkup()
     btn1 = types.InlineKeyboardButton("Категории", callback_data="menu_categories")
@@ -88,7 +96,6 @@ def get_back_keyboard():
 # ==========================
 # Функции отправки/редактирования сообщений
 # ==========================
-
 def send_main_menu(chat_id):
     text = "Главное меню"
     keyboard = get_main_keyboard()
@@ -114,6 +121,8 @@ def send_text(chat_id, text, reply_markup=None):
 
 def generate_chart(data, filename="chart.png"):
     try:
+        if not data or sum(data.values()) == 0:
+            return None
         labels = list(data.keys())
         values = list(data.values())
         plt.figure()
@@ -128,25 +137,34 @@ def generate_chart(data, filename="chart.png"):
         return None
 
 # ==========================
-# Таймер текущей задачи (работает в отдельном потоке)
+# Таймер текущей задачи (в отдельном потоке)
 # ==========================
-
 def timer_thread(chat_id, task_id, stop_event):
     while not stop_event.is_set():
         time.sleep(10)
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT start_time, saved_time, task_id FROM current_task WHERE chat_id = ?", (chat_id,))
+        # Выполняем join, чтобы получить имена задачи и категории
+        cursor.execute('''
+            SELECT ct.start_time, ct.saved_time, t.name, c.name 
+            FROM current_task ct 
+            JOIN tasks t ON ct.task_id = t.id 
+            JOIN categories c ON t.category_id = c.id 
+            WHERE ct.chat_id = ?
+        ''', (chat_id,))
         row = cursor.fetchone()
         if row:
-            start_time, saved_time, current_task_id = row
+            start_time, saved_time, task_name, cat_name = row
             # Если задача изменилась, завершаем поток
-            if current_task_id != task_id:
+            cursor.execute("SELECT task_id FROM current_task WHERE chat_id = ?", (chat_id,))
+            current = cursor.fetchone()
+            if not current or current[0] != task_id:
                 conn.close()
                 break
             elapsed = int(time.time()) - start_time
             total = saved_time + elapsed
-            text = f"Текущая задача (ID: {task_id})\nВремя выполнения: {total} сек."
+            formatted_time = format_time(total)
+            text = f"Текущая задача:\nКатегория: {cat_name}\nЗадача: {task_name}\nВремя: {formatted_time}"
             try:
                 bot.edit_message_text(text, chat_id, main_messages.get(chat_id, 0))
             except Exception as e:
@@ -155,18 +173,16 @@ def timer_thread(chat_id, task_id, stop_event):
     logger.info("Timer thread for chat_id %s ended", chat_id)
 
 def start_timer(chat_id, task_id):
-    stop_timer(chat_id)  # остановим предыдущий таймер, если он есть
+    stop_timer(chat_id)  # остановим предыдущий таймер, если есть
     conn = get_db_connection()
     cursor = conn.cursor()
     now = int(time.time())
     cursor.execute("SELECT id FROM current_task WHERE chat_id = ?", (chat_id,))
     row = cursor.fetchone()
     if row:
-        cursor.execute("UPDATE current_task SET task_id = ?, start_time = ?, saved_time = 0 WHERE chat_id = ?",
-                       (task_id, now, chat_id))
+        cursor.execute("UPDATE current_task SET task_id = ?, start_time = ?, saved_time = 0 WHERE chat_id = ?", (task_id, now, chat_id))
     else:
-        cursor.execute("INSERT INTO current_task (chat_id, task_id, start_time, saved_time) VALUES (?, ?, ?, 0)",
-                       (chat_id, task_id, now))
+        cursor.execute("INSERT INTO current_task (chat_id, task_id, start_time, saved_time) VALUES (?, ?, ?, 0)", (chat_id, task_id, now))
     conn.commit()
     conn.close()
     stop_event = threading.Event()
@@ -203,7 +219,7 @@ def stop_timer(chat_id):
 # Обработчики команд и callback'ов
 # ==========================
 
-# Обработчик команды /start
+# Команда /start
 @bot.message_handler(commands=['start'])
 def handle_start(message):
     chat_id = message.chat.id
@@ -213,7 +229,7 @@ def handle_start(message):
     except Exception as e:
         logger.exception("Error deleting /start message: %s", e)
 
-# Обработчик callback для главного меню (начинается с "menu_")
+# При нажатии кнопки главного меню
 @bot.callback_query_handler(func=lambda call: call.data.startswith("menu_"))
 def handle_menu(call):
     chat_id = call.message.chat.id
@@ -229,62 +245,23 @@ def handle_menu(call):
     except Exception as e:
         logger.exception("Error answering callback: %s", e)
 
+# Отображение категорий: выводится сообщение "Выберите категорию:" с кнопками, без дублирования текста
 def show_categories(chat_id):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name FROM categories")
     rows = cursor.fetchall()
     conn.close()
-    text = "Категории:\n"
-    # Формируем клавиатуру напрямую через markup.add()
+    text = "Выберите категорию:"
     markup = types.InlineKeyboardMarkup()
     for row in rows:
         cat_id, name = row
-        text += f"{cat_id}. {name}\n"
-        markup.add(types.InlineKeyboardButton(text=name, callback_data=f"view_tasks_{cat_id}"))
+        # Кнопка ведёт в подменю управления категорией
+        markup.add(types.InlineKeyboardButton(text=name, callback_data=f"manage_cat_{cat_id}"))
     markup.add(types.InlineKeyboardButton(text="Добавить категорию", callback_data="add_category"))
     markup.add(types.InlineKeyboardButton(text="Назад", callback_data="back_main"))
     send_text(chat_id, text, reply_markup=markup)
     logger.info("Displayed categories to chat_id %s", chat_id)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("view_tasks_"))
-def handle_view_tasks(call):
-    chat_id = call.message.chat.id
-    cat_id = int(call.data.split("_")[-1])
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, name, total_time FROM tasks WHERE category_id = ?", (cat_id,))
-    rows = cursor.fetchall()
-    conn.close()
-    text = f"Задачи в категории {cat_id}:\n"
-    markup = types.InlineKeyboardMarkup()
-    for row in rows:
-        task_id, name, total_time = row
-        text += f"{task_id}. {name} (Время: {total_time} сек.)\n"
-        markup.add(types.InlineKeyboardButton(text=f"Выбрать {name}", callback_data=f"select_task_{task_id}"))
-    markup.add(types.InlineKeyboardButton(text="Добавить задачу", callback_data=f"add_task_{cat_id}"))
-    markup.add(types.InlineKeyboardButton(text="Назад", callback_data="menu_categories"))
-    send_text(chat_id, text, reply_markup=markup)
-    try:
-        bot.answer_callback_query(call.id)
-    except Exception as e:
-        logger.exception("Error answering callback: %s", e)
-    logger.info("Displayed tasks for category %s to chat_id %s", cat_id, chat_id)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("select_task_"))
-def handle_select_task(call):
-    chat_id = call.message.chat.id
-    task_id = int(call.data.split("_")[-1])
-    stop_timer(chat_id)
-    start_timer(chat_id, task_id)
-    text = f"Выбрана задача с ID {task_id}. Таймер запущен."
-    markup = get_back_keyboard()
-    send_text(chat_id, text, reply_markup=markup)
-    try:
-        bot.answer_callback_query(call.id)
-    except Exception as e:
-        logger.exception("Error answering callback: %s", e)
-    logger.info("Selected task %s for chat_id %s", task_id, chat_id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("add_category"))
 def handle_add_category(call):
@@ -314,6 +291,122 @@ def process_add_category(message):
     user_states.pop(chat_id, None)
     logger.info("Added new category '%s' for chat_id %s", cat_name, chat_id)
 
+
+# Подменю для выбранной категории: просмотр задач, редактирование, удаление
+@bot.callback_query_handler(func=lambda call: call.data.startswith("manage_cat_"))
+def handle_manage_category(call):
+    chat_id = call.message.chat.id
+    cat_id = int(call.data.split("_")[-1])
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM categories WHERE id = ?", (cat_id,))
+    row = cursor.fetchone()
+    conn.close()
+    cat_name = row[0] if row else "Неизвестно"
+    text = f"Категория: {cat_name}\nВыберите действие:"
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(text="Просмотреть задачи", callback_data=f"view_tasks_{cat_id}"))
+    markup.row(
+        types.InlineKeyboardButton(text="Редактировать", callback_data=f"edit_cat_{cat_id}"),
+        types.InlineKeyboardButton(text="Удалить", callback_data=f"delete_cat_{cat_id}")
+    )
+    markup.add(types.InlineKeyboardButton(text="Назад", callback_data="menu_categories"))
+    bot.edit_message_text(text, chat_id, call.message.message_id, reply_markup=markup)
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        logger.exception("Error answering callback: %s", e)
+    logger.info("Displayed management for category %s", cat_id)
+
+# Редактирование категории: запрос нового названия
+@bot.callback_query_handler(func=lambda call: call.data.startswith("edit_cat_"))
+def handle_edit_category(call):
+    chat_id = call.message.chat.id
+    cat_id = int(call.data.split("_")[-1])
+    bot.edit_message_text("Введите новое название категории:", chat_id, call.message.message_id)
+    user_states[chat_id] = {"state": "editing_category", "category_id": cat_id}
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        logger.exception("Error answering callback: %s", e)
+
+@bot.message_handler(func=lambda message: message.chat.id in user_states and user_states[message.chat.id].get("state") == "editing_category")
+def process_edit_category(message):
+    chat_id = message.chat.id
+    new_name = message.text.strip()
+    cat_id = user_states[chat_id]["category_id"]
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE categories SET name = ? WHERE id = ?", (new_name, cat_id))
+    conn.commit()
+    conn.close()
+    send_main_menu(chat_id)
+    try:
+        bot.delete_message(chat_id, message.message_id)
+    except Exception as e:
+        logger.exception("Error deleting message: %s", e)
+    user_states.pop(chat_id, None)
+    logger.info("Edited category %s for chat_id %s", cat_id, chat_id)
+
+# Удаление категории
+@bot.callback_query_handler(func=lambda call: call.data.startswith("delete_cat_"))
+def handle_delete_category(call):
+    cat_id = int(call.data.split("_")[-1])
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # Удаляем все задачи из этой категории
+    cursor.execute("DELETE FROM tasks WHERE category_id = ?", (cat_id,))
+    cursor.execute("DELETE FROM categories WHERE id = ?", (cat_id,))
+    conn.commit()
+    conn.close()
+    send_main_menu(call.message.chat.id)
+    try:
+        bot.answer_callback_query(call.id, "Категория удалена")
+    except Exception as e:
+        logger.exception("Error answering callback: %s", e)
+    logger.info("Deleted category %s", cat_id)
+
+# Просмотр задач в категории
+@bot.callback_query_handler(func=lambda call: call.data.startswith("view_tasks_"))
+def handle_view_tasks(call):
+    chat_id = call.message.chat.id
+    cat_id = int(call.data.split("_")[-1])
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name, total_time FROM tasks WHERE category_id = ?", (cat_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    text = f"Задачи в категории {cat_id}:"
+    markup = types.InlineKeyboardMarkup()
+    for row in rows:
+        task_id, name, total_time = row
+        markup.add(types.InlineKeyboardButton(text=f"Выбрать {name}", callback_data=f"select_task_{task_id}"))
+    markup.add(types.InlineKeyboardButton(text="Добавить задачу", callback_data=f"add_task_{cat_id}"))
+    markup.add(types.InlineKeyboardButton(text="Назад", callback_data="menu_categories"))
+    send_text(chat_id, text, reply_markup=markup)
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        logger.exception("Error answering callback: %s", e)
+    logger.info("Displayed tasks for category %s to chat_id %s", cat_id, chat_id)
+
+# Выбор задачи (запуск таймера)
+@bot.callback_query_handler(func=lambda call: call.data.startswith("select_task_"))
+def handle_select_task(call):
+    chat_id = call.message.chat.id
+    task_id = int(call.data.split("_")[-1])
+    stop_timer(chat_id)
+    start_timer(chat_id, task_id)
+    text = f"Выбрана задача с ID {task_id}. Таймер запущен."
+    markup = get_back_keyboard()
+    send_text(chat_id, text, reply_markup=markup)
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        logger.exception("Error answering callback: %s", e)
+    logger.info("Selected task %s for chat_id %s", task_id, chat_id)
+
+# Добавление задачи: запрос названия задачи
 @bot.callback_query_handler(func=lambda call: call.data.startswith("add_task_"))
 def handle_add_task(call):
     chat_id = call.message.chat.id
@@ -340,48 +433,36 @@ def process_add_task(message):
     try:
         bot.delete_message(chat_id, message.message_id)
     except Exception as e:
-        logger.exception("Error deleting user message: %s", e)
+        logger.exception("Error deleting message: %s", e)
     user_states.pop(chat_id, None)
     logger.info("Added new task '%s' in category %s for chat_id %s", task_name, cat_id, chat_id)
 
-@bot.callback_query_handler(func=lambda call: call.data == "back_main")
-def handle_back(call):
-    chat_id = call.message.chat.id
-    send_main_menu(chat_id)
-    try:
-        bot.answer_callback_query(call.id)
-    except Exception as e:
-        logger.exception("Error answering callback: %s", e)
-    logger.info("User returned to main menu chat_id %s", chat_id)
-
-# Глобальный обработчик callback для логирования
-@bot.callback_query_handler(func=lambda call: True)
-def log_all_callbacks(call):
-    logger.info("Global callback received: %s", call.data)
-    try:
-        bot.answer_callback_query(call.id)
-    except Exception as e:
-        logger.exception("Error answering callback: %s", e)
-
-# Функция для отображения текущей задачи
+# Отображение текущей задачи с названием категории и задачи, а также временем в читаемом виде
 def show_current_task(chat_id):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT task_id, start_time, saved_time FROM current_task WHERE chat_id = ?", (chat_id,))
+    cursor.execute('''
+        SELECT t.name, c.name, ct.start_time, ct.saved_time 
+        FROM current_task ct 
+        JOIN tasks t ON ct.task_id = t.id 
+        JOIN categories c ON t.category_id = c.id 
+        WHERE ct.chat_id = ?
+    ''', (chat_id,))
     row = cursor.fetchone()
     conn.close()
     if row:
-        task_id, start_time, saved_time = row
+        task_name, cat_name, start_time, saved_time = row
         elapsed = int(time.time()) - start_time
         total = saved_time + elapsed
-        text = f"Текущая задача (ID: {task_id})\nВремя выполнения: {total} сек."
+        formatted_time = format_time(total)
+        text = f"Текущая задача:\nКатегория: {cat_name}\nЗадача: {task_name}\nВремя: {formatted_time}"
     else:
         text = "Нет активной задачи."
     markup = get_back_keyboard()
     send_text(chat_id, text, reply_markup=markup)
     logger.info("Displayed current task for chat_id %s", chat_id)
 
-# Функция для отображения статистики
+# Отображение статистики: если нет данных – график не генерируется
 def show_statistics(chat_id):
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -396,17 +477,37 @@ def show_statistics(chat_id):
     text = "Статистика по категориям:\n"
     data = {}
     for row in rows:
-        name, total_time = row
+        cat_name, total_time = row
         total_time = total_time if total_time else 0
-        text += f"{name}: {total_time} сек.\n"
-        data[name] = total_time
+        text += f"{cat_name}: {total_time} сек.\n"
+        data[cat_name] = total_time
     chart_file = generate_chart(data)
     markup = get_back_keyboard()
     send_text(chat_id, text, reply_markup=markup)
-    if chart_file and os.path.exists(chart_file):
+    if chart_file:
         bot.send_photo(chat_id, photo=open(chart_file, 'rb'))
         os.remove(chart_file)
     logger.info("Displayed statistics for chat_id %s", chat_id)
+
+# Обработка кнопки "Назад" для возврата в главное меню
+@bot.callback_query_handler(func=lambda call: call.data == "back_main")
+def handle_back(call):
+    chat_id = call.message.chat.id
+    send_main_menu(chat_id)
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        logger.exception("Error answering callback: %s", e)
+    logger.info("User returned to main menu chat_id %s", chat_id)
+
+# # Глобальный обработчик callback для логирования
+# @bot.callback_query_handler(func=lambda call: True)
+# def log_all_callbacks(call):
+#     logger.info("Global callback received: %s", call.data)
+#     try:
+#         bot.answer_callback_query(call.id)
+#     except Exception as e:
+#         logger.exception("Error answering callback: %s", e)
 
 if __name__ == '__main__':
     init_db()
